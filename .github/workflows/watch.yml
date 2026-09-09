@@ -1,0 +1,58 @@
+name: watch
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub cron is best-effort and can run late under load;
+    # that is fine here, since we are watching for cancellations rather than
+    # racing anyone for a slot.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+# Only one check at a time. A delayed run must not overlap the next one and
+# race on state.json.
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install --quiet requests
+
+      - name: Check availability
+        env:
+          BOOKINGS_BUSINESS: ${{ secrets.BOOKINGS_BUSINESS }}
+          BOOKINGS_SERVICE_ID: ${{ secrets.BOOKINGS_SERVICE_ID }}
+          BOOKINGS_STAFF_ID: ${{ secrets.BOOKINGS_STAFF_ID }}
+          CURRENT_BOOKING: ${{ secrets.CURRENT_BOOKING }}
+          BOOKING_URL: ${{ secrets.BOOKING_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SERVICE_MINUTES: "20"
+          EARLIEST_TIME: "16:30"
+        run: python check.py
+
+      - name: Persist dedup state
+        run: |
+          if [[ -n "$(git status --porcelain state.json)" ]]; then
+            git config user.name  "greep-watch"
+            git config user.email "actions@users.noreply.github.com"
+            git add state.json
+            git commit -m "state: $(date -u +%FT%TZ) [skip ci]"
+            # A concurrent run may have pushed first; rebase rather than fail.
+            git pull --rebase --autostash origin main || true
+            git push
+          else
+            echo "no state change"
+          fi
