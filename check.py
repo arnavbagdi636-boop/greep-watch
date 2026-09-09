@@ -23,7 +23,9 @@ import requests
 
 BASE = "https://bookings.cloud.microsoft/BookingsService/api/V1/bookingBusinessesc2"
 STATE_FILE = Path(__file__).resolve().parent / "state.json"
-HTTP_TIMEOUT = 25.0
+# The endpoint has been seen taking 17s under load; keep real headroom so a
+# slow response is a wait rather than a missed check.
+HTTP_TIMEOUT = 45.0
 
 
 def env(name: str, required: bool = True) -> str:
