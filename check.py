@@ -11,10 +11,12 @@ so this file stays generic enough to sit in a public repo.
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -121,7 +123,8 @@ def send_telegram(text: str) -> bool:
     return False
 
 
-def main() -> int:
+def check(alerted: set) -> tuple:
+    """One pass. Returns (updated alerted set, number of live matches)."""
     now = dt.datetime.now()
     slots = fetch_slots()
     matches = sorted(
@@ -129,13 +132,11 @@ def main() -> int:
     )
     live = {s["start"].strftime("%Y-%m-%dT%H:%M") for s in matches}
 
-    try:
-        alerted = set(json.loads(STATE_FILE.read_text()).get("alerted", []))
-    except (OSError, json.JSONDecodeError):
-        alerted = set()
-
     fresh = [s for s in matches if s["start"].strftime("%Y-%m-%dT%H:%M") not in alerted]
-    print(f"{len(slots)} windows, {len(matches)} match, {len(fresh)} new")
+    print(
+        f"[{now:%H:%M:%S}] {len(slots)} windows, {len(matches)} match, {len(fresh)} new",
+        flush=True,
+    )
 
     newly = set()
     if fresh:
@@ -149,21 +150,63 @@ def main() -> int:
             lines += ["", f"[Reschedule here]({BOOKING_URL})"]
         if send_telegram("\n".join(lines)):
             newly = {s["start"].strftime("%Y-%m-%dT%H:%M") for s in fresh}
-            print("alert sent")
+            print("alert sent", flush=True)
         else:
-            # Leave it unmarked so the next run retries rather than losing it.
-            print("alert FAILED - will retry next run")
+            # Leave it unmarked so the next pass retries rather than losing it.
+            print("alert FAILED - will retry next pass", flush=True)
+
+    return (alerted & live) | newly, len(matches)
+
+
+def main() -> int:
+    """Single pass by default; --minutes turns it into a long-running loop.
+
+    GitHub will not schedule a */5 cron reliably on a low-traffic repo, but a
+    job that has already started runs to completion. So one triggered run
+    loops internally for hours instead of exiting after 27 seconds.
+    """
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--minutes", type=float, default=0, help="loop for this long")
+    ap.add_argument("--interval", type=float, default=300, help="seconds between passes")
+    args = ap.parse_args()
+
+    try:
+        alerted = set(json.loads(STATE_FILE.read_text()).get("alerted", []))
+    except (OSError, json.JSONDecodeError):
+        alerted = set()
+
+    started = dt.datetime.now()
+    deadline = started + dt.timedelta(minutes=args.minutes)
+    passes = 0
+    matches = 0
+
+    while True:
+        try:
+            alerted, matches = check(alerted)
+            passes += 1
+        except Exception as exc:  # noqa: BLE001 - one bad request must not end the run
+            print(f"pass failed: {exc}", flush=True)
+
+        if args.minutes <= 0 or dt.datetime.now() >= deadline:
+            break
+        # Do not overshoot the deadline with a final long sleep.
+        remaining = (deadline - dt.datetime.now()).total_seconds()
+        if remaining <= 0:
+            break
+        time.sleep(min(args.interval, remaining))
 
     STATE_FILE.write_text(
         json.dumps(
             {
-                "alerted": sorted((alerted & live) | newly),
-                "last_check": now.isoformat(timespec="seconds"),
-                "matches": len(matches),
+                "alerted": sorted(alerted),
+                "last_check": dt.datetime.now().isoformat(timespec="seconds"),
+                "matches": matches,
+                "passes": passes,
             },
             indent=2,
         )
     )
+    print(f"done: {passes} passes over {(dt.datetime.now()-started)}", flush=True)
     return 0
 
 
