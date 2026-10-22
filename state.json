@@ -1,14 +1,7 @@
 {
   "alerted": [],
-  "booked": [
-    {
-      "booked_at": "2026-10-22T15:19:59",
-      "confirmed": false,
-      "id": "",
-      "slot": "2026-12-01T18:30"
-    }
-  ],
-  "last_check": "2026-10-22T15:20:06",
+  "booked": [],
+  "last_check": "2026-10-22T15:20:08",
   "matches": 0,
   "passes": 0
 }
