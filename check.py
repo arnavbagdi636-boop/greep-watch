@@ -35,6 +35,12 @@ import requests
 
 BASE = "https://bookings.cloud.microsoft/BookingsService/api/V1/bookingBusinessesc2"
 STATE_FILE = Path(__file__).resolve().parent / "state.json"
+
+# Bump this whenever build_booking_payload() changes shape. Slots that failed
+# permanently are remembered against the version that failed, so fixing the
+# payload automatically makes them eligible again instead of needing the
+# failure list cleared by hand.
+PAYLOAD_VERSION = 2
 HTTP_TIMEOUT = 45.0
 TZ_NAME = "Eastern Standard Time"
 UA = "greep-watch/2.0 (personal appointment watcher)"
@@ -221,6 +227,7 @@ def load_state() -> dict:
         data = {}
     data.setdefault("alerted", [])
     data.setdefault("booked", [])      # [{slot, booked_at, confirmed, id}]
+    data.setdefault("failed", {})      # slot_key -> {version, error, at}
     return data
 
 
@@ -257,6 +264,14 @@ def cap_blocks(data: dict, now: dt.datetime, slot: dict) -> str:
         return f"{len(upcoming)} upcoming DBAs already held (cap {CONCURRENT_CAP})"
     if any(b["slot"] == key_of(slot) for b in data["booked"]):
         return "this exact slot is already recorded as booked"
+    # A 400 means the request itself is wrong, so the next identical attempt
+    # fails identically. The first version of this script retried one bad
+    # payload 18 times in two hours, churning a reserve/release commit pair
+    # each time and hammering Microsoft from a school account. Remember the
+    # refusal against PAYLOAD_VERSION and stop until the payload changes.
+    prior = data["failed"].get(key_of(slot))
+    if prior and prior.get("version") == PAYLOAD_VERSION:
+        return f"payload v{PAYLOAD_VERSION} was already refused: {prior.get('error', '')[:80]}"
     return ""
 
 
@@ -326,7 +341,12 @@ def build_booking_payload(slot: dict, policy: dict) -> dict:
 
 
 def book(sess: requests.Session, slot: dict, policy: dict, dry: bool) -> tuple:
-    """Submit the booking. Returns (ok, detail).
+    """Submit the booking. Returns (ok, detail, permanent).
+
+    `permanent` says whether retrying this exact payload is pointless. A 4xx
+    is the server rejecting the request as malformed or the slot as gone -
+    identical retries get identical refusals. A 5xx, a timeout or a 429 is
+    worth another pass.
 
     The exact field names of this endpoint are not published; the route is
     confirmed live and anonymous (an empty POST returns 500, not 401 or 404),
@@ -337,19 +357,19 @@ def book(sess: requests.Session, slot: dict, policy: dict, dry: bool) -> tuple:
     if dry:
         print("DRY RUN - would POST:", flush=True)
         print(redact(json.dumps(payload, indent=2)), flush=True)
-        return False, "dry run"
+        return False, "dry run", False
 
     missing = [n for n, v in (("CUSTOMER_NAME", CUSTOMER_NAME),
                               ("CUSTOMER_PHONE", CUSTOMER_PHONE)) if not v]
     if missing:
-        return False, f"refusing to book without {', '.join(missing)}"
+        return False, f"refusing to book without {', '.join(missing)}", True
 
     url = f"{BASE}/{requests.utils.quote(BUSINESS)}/appointments"
     try:
         resp = sess.post(url, json=payload, timeout=HTTP_TIMEOUT,
                          headers={"Content-Type": "application/json"})
     except requests.RequestException as exc:
-        return False, f"network error: {exc}"
+        return False, f"network error: {exc}", False
 
     body = redact((resp.text or "")[:800])
     print(f"booking HTTP {resp.status_code}: {body}", flush=True)
@@ -359,8 +379,11 @@ def book(sess: requests.Session, slot: dict, policy: dict, dry: bool) -> tuple:
             appt_id = parsed.get("appointmentId") or parsed.get("id") or ""
         except ValueError:
             appt_id = ""
-        return True, appt_id
-    return False, f"HTTP {resp.status_code}: {body}"
+        return True, appt_id, False
+
+    # 429 is "slow down", not "never"; everything else in 4xx is a real refusal.
+    permanent = 400 <= resp.status_code < 500 and resp.status_code != 429
+    return False, f"HTTP {resp.status_code}: {body}", permanent
 
 
 # --------------------------------------------------------------------------
@@ -430,7 +453,7 @@ def check(sess: requests.Session, data: dict, policy: dict, dry: bool) -> dict:
         print("could not persist reservation - declining to book", flush=True)
         return data
 
-    ok, detail = book(sess, target, policy, dry)
+    ok, detail, permanent = book(sess, target, policy, dry)
     if ok:
         for b in data["booked"]:
             if b["slot"] == key_of(target):
@@ -448,15 +471,26 @@ def check(sess: requests.Session, data: dict, policy: dict, dry: bool) -> dict:
         # Release the reservation so a real slot is not permanently burned by
         # a failed attempt, and so a dry run leaves no trace in state.
         data["booked"] = [b for b in data["booked"] if b["slot"] != key_of(target)]
+        if permanent:
+            # Record it so cap_blocks() stops retrying this payload, and say
+            # so once rather than on every pass for the rest of the run.
+            data["failed"][key_of(target)] = {
+                "version": PAYLOAD_VERSION,
+                "error": detail[:200],
+                "at": now.isoformat(timespec="seconds"),
+            }
         save_state(data)
         if not dry:
             git_persist(f"release {key_of(target)} [skip ci]")
             send_telegram(
                 f"*Algebra 2 DBA booking FAILED*\n\n"
                 f"- *{pretty(target['start'])}*\n- {detail[:300]}\n\n"
-                f"[Book manually]({BOOKING_URL})"
+                + ("No further attempts on this slot until the payload "
+                   "changes.\n\n" if permanent else "")
+                + f"[Book manually]({BOOKING_URL})"
             )
-        print(f"booking not completed: {detail}", flush=True)
+        print(f"booking not completed ({'permanent' if permanent else 'transient'})"
+              f": {detail}", flush=True)
     return data
 
 
