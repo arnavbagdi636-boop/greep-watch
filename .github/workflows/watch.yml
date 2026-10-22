@@ -55,8 +55,12 @@ jobs:
           CUSTOMER_EMAIL: ${{ secrets.CUSTOMER_EMAIL }}
           COURSE_ENROLLMENT: "Alg 2 / Alg 2 Honors"
           EARLIEST_TIME: ${{ vars.EARLIEST_TIME || '16:20' }}
-          MONTHLY_CAP: "2"
-          CONCURRENT_CAP: "2"
+          MONTHLY_CAP: ${{ vars.MONTHLY_CAP || '2' }}
+          # Held at once. Starts at 1 so the first live run books a single
+          # appointment: the POST field names are inferred, not documented, so
+          # the first real attempt is also the test. Raise to 2 once one
+          # booking has come back confirmed.
+          CONCURRENT_CAP: ${{ vars.CONCURRENT_CAP || '1' }}
         # Booking is opt-in twice over: the repo variable BOOK must be "true"
         # for scheduled runs, or the workflow_dispatch box must be ticked.
         # A watcher that books by default is one typo away from filling a
