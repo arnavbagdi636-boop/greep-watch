@@ -9,6 +9,11 @@ on:
   repository_dispatch:
     types: [watch]
   workflow_dispatch:
+    inputs:
+      book:
+        description: "Submit real bookings (otherwise dry run)"
+        type: boolean
+        default: false
 
 # One watcher at a time. A new trigger cancels a run that is already going,
 # so a fresh 5.5-hour window starts rather than two overlapping ones.
@@ -35,20 +40,46 @@ jobs:
 
       - name: Watch for 5.5 hours, checking every 5 minutes
         env:
+          # Identifiers default to Mrs. Jewell's Algebra 2 DBA in check.py, so
+          # these secrets only need setting to point at a different calendar.
           BOOKINGS_BUSINESS: ${{ secrets.BOOKINGS_BUSINESS }}
           BOOKINGS_SERVICE_ID: ${{ secrets.BOOKINGS_SERVICE_ID }}
           BOOKINGS_STAFF_ID: ${{ secrets.BOOKINGS_STAFF_ID }}
-          CURRENT_BOOKING: ${{ secrets.CURRENT_BOOKING }}
           BOOKING_URL: ${{ secrets.BOOKING_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          SERVICE_MINUTES: "20"
-          EARLIEST_TIME: "16:30"
-        run: python check.py --minutes 330 --interval 300
+          # Submitted with the booking. Without CUSTOMER_NAME and
+          # CUSTOMER_PHONE the script refuses to book and only alerts.
+          CUSTOMER_NAME: ${{ secrets.CUSTOMER_NAME }}
+          CUSTOMER_PHONE: ${{ secrets.CUSTOMER_PHONE }}
+          CUSTOMER_EMAIL: ${{ secrets.CUSTOMER_EMAIL }}
+          COURSE_ENROLLMENT: "Alg 2 / Alg 2 Honors"
+          EARLIEST_TIME: ${{ vars.EARLIEST_TIME || '16:20' }}
+          MONTHLY_CAP: "2"
+          CONCURRENT_CAP: "2"
+        # Booking is opt-in twice over: the repo variable BOOK must be "true"
+        # for scheduled runs, or the workflow_dispatch box must be ticked.
+        # A watcher that books by default is one typo away from filling a
+        # teacher's calendar, so the default is a dry run.
+        run: |
+          BOOK_FLAG=""
+          if [[ "${{ vars.BOOK }}" == "true" || "${{ inputs.book }}" == "true" ]]; then
+            BOOK_FLAG="--book"
+            echo "::notice::booking ENABLED"
+          else
+            echo "::notice::dry run - no bookings will be submitted"
+          fi
+          python check.py --minutes 330 --interval 300 $BOOK_FLAG
 
       - name: Persist dedup state
         # Runs even if the watch step is cancelled by a newer trigger, so a
         # slot alerted just before cancellation is not re-alerted later.
+        #
+        # Booking records are pushed by check.py itself the moment they are
+        # made, because the monthly cap depends on them surviving. This step
+        # only mops up the alert-dedup set, where a lost push costs one
+        # duplicate Telegram message - but it still reports a failed push
+        # instead of swallowing it, so a broken token is visible.
         if: always()
         run: |
           if [[ -n "$(git status --porcelain state.json)" ]]; then
@@ -56,8 +87,10 @@ jobs:
             git config user.email "actions@users.noreply.github.com"
             git add state.json
             git commit -m "state: $(date -u +%FT%TZ) [skip ci]"
-            git pull --rebase --autostash origin main || true
-            git push || true
+            git pull --rebase --autostash origin main
+            if ! git push; then
+              echo "::warning::state push failed - dedup may repeat an alert"
+            fi
           else
             echo "no state change"
           fi
