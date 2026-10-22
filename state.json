@@ -1,7 +1,8 @@
 {
   "alerted": [],
   "booked": [],
-  "last_check": "2026-10-22T15:36:21",
+  "failed": {},
+  "last_check": "2026-10-22T22:40:07",
   "matches": 0,
   "passes": 0
 }
