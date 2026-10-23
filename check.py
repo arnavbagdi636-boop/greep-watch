@@ -40,7 +40,7 @@ STATE_FILE = Path(__file__).resolve().parent / "state.json"
 # permanently are remembered against the version that failed, so fixing the
 # payload automatically makes them eligible again instead of needing the
 # failure list cleared by hand.
-PAYLOAD_VERSION = 3
+PAYLOAD_VERSION = 4
 HTTP_TIMEOUT = 45.0
 TZ_NAME = "Eastern Standard Time"
 UA = "greep-watch/2.0 (personal appointment watcher)"
@@ -177,16 +177,46 @@ def fetch_policy(sess: requests.Session) -> dict:
 
     pol = svc.get("bookingsSchedulingPolicy") or {}
     minutes = int(re.sub(r"\D", "", svc.get("defaultDuration") or "PT30M") or 30)
-    required_qids = [
-        q["questionGuid"] for q in (svc.get("customQuestions") or [])
-        if q.get("required")
-    ]
+
+    # The real payload embeds each question's whole definition, not just its
+    # id, so fetch the definitions and key them by guid.
+    qdefs = {}
+    try:
+        qresp = sess.get(f"{BASE}/{requests.utils.quote(BUSINESS)}/customQuestions",
+                         timeout=HTTP_TIMEOUT)
+        qresp.raise_for_status()
+        qbody = qresp.json()
+        qarr = qbody if isinstance(qbody, list) else next(
+            (v for v in qbody.values() if isinstance(v, list)), [])
+        qdefs = {q["id"]: q for q in qarr if q.get("id")}
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        print(f"WARN: could not load custom questions: {exc}", flush=True)
+
+    questions = []
+    for q in (svc.get("customQuestions") or []):
+        guid = q.get("questionGuid")
+        definition = qdefs.get(guid)
+        if definition:
+            questions.append({"definition": definition,
+                              "required": bool(q.get("required"))})
+
+    # The service's own bookable windows, which are narrower than the
+    # business hours and are what the booking page actually offers.
+    windows = {}
+    for block in (pol.get("bookingServiceWindows") or []):
+        for day in (block.get("bookableHours") or []):
+            windows.setdefault(day.get("day", ""), []).extend(
+                (s.get("start", 0), s.get("end", 0))
+                for s in (day.get("timeSlots") or [])
+            )
+
     return {
         "title": svc.get("title") or "",
         "minutes": minutes,
         "lead_days": iso_duration_days(pol.get("minimumLeadTime"), 1),
         "advance_days": iso_duration_days(pol.get("maximumAdvance"), 45),
-        "required_qids": required_qids,
+        "questions": questions,
+        "windows": windows,
     }
 
 
@@ -223,20 +253,38 @@ def fetch_slots(sess: requests.Session, policy: dict) -> list:
     return out
 
 
+def within_service_window(start: dt.datetime, policy: dict) -> bool:
+    """Does a full appointment starting here fit inside a bookable window?
+
+    bookableHours are minutes from midnight, per weekday name. The whole
+    appointment must fit, not just its start, or the server rejects it.
+    """
+    windows = policy.get("windows") or {}
+    if not windows:
+        return True  # nothing published; do not invent a restriction
+    slots = windows.get(start.strftime("%A")) or []
+    begin = start.hour * 60 + start.minute
+    finish = begin + policy["minutes"]
+    return any(w_start <= begin and finish <= w_end for w_start, w_end in slots)
+
+
 def eligible(slot: dict, now: dt.datetime, policy: dict) -> bool:
     """Is this slot one Arnav could actually attend and actually book?
 
-    The wall-clock rule is the binding one. This service's bookable windows
-    are Mon/Wed 10:00-13:30, Tue/Thu 11:00-13:00 and 18:00-20:00, Fri
-    10:00-12:00 - so an "after 4:20 PM" filter leaves only the Tue/Thu
-    evening block. That is intended (everything else is during school) but it
-    means roughly five candidate start times, twice a week.
+    Two separate calendars are at work and conflating them produced phantom
+    slots. GetStaffAvailability returns when the TEACHER is free; the service
+    carries its own narrower bookableHours, and the booking page only offers
+    the intersection. Filtering on staff availability alone reported a Dec 1
+    6:30 PM opening that the page does not list at all, so the watcher would
+    have kept trying to book a time no customer can book.
     """
     if not slot["status"].endswith("AVAILABLE"):
         return False
     if slot["minutes"] < policy["minutes"]:
         return False
     if slot["start"].time() < dt.time(EARLIEST_H, EARLIEST_M):
+        return False
+    if not within_service_window(slot["start"], policy):
         return False
     # The server rejects anything inside minimumLeadTime, so never aim there.
     if slot["start"] < now + dt.timedelta(days=policy["lead_days"]):
@@ -362,20 +410,40 @@ def build_booking_payload(slot: dict, policy: dict) -> dict:
       * customers[] takes name, emailAddress, phone, timeZone and notes;
         displayName, email, address and customerId are all rejected
 
-    STILL UNRESOLVED: where the required "Course enrollment" answer goes.
-    Every plausible name was rejected at appointment level, inside
-    customers[], and as a sibling of "appointment". Until it is found, the
-    answer rides in customers[].notes - accepted by the API, and it puts the
-    information in front of the teacher either way. If the server insists on
-    the real field, it will say so by name and that completes the schema.
+    The guessing was eventually abandoned in favour of observing the real
+    client: an interceptor in the browser captured the body the booking page
+    itself sends, with the request blocked so nothing was created. This mirrors
+    that capture. Three fields the probes had "confirmed" were wrong in it -
+    there is no `duration` and no `serviceName`, and `isLocationOnline` is
+    false, not true - which is why the captured body wins over inference.
+
+    The custom-question answer lives in customers[].answeredCustomQuestions
+    and embeds the question's whole definition, not just its id. That is why
+    no amount of guessing a flat {questionId, answer} shape ever landed.
     """
     end = slot["start"] + dt.timedelta(minutes=policy["minutes"])
-    note = f"Course enrollment: {COURSE_ENROLLMENT}"
+
+    answered = []
+    for q in policy["questions"]:
+        definition = q["definition"]
+        options = definition.get("answerOptions") or []
+        # selectedOptions is the chosen option's INDEX as a string.
+        selected = [str(options.index(COURSE_ENROLLMENT))] \
+            if COURSE_ENROLLMENT in options else []
+        answered.append({
+            "customQuestion": {
+                "id": definition.get("id", ""),
+                "questionText": definition.get("questionText", ""),
+                "answerOptions": options,
+                "answerInputType": definition.get("answerInputType", ""),
+            },
+            "answer": COURSE_ENROLLMENT if selected else "",
+            "isRequired": q["required"],
+            "selectedOptions": selected,
+        })
+
     return {
         "appointment": {
-            "serviceId": SERVICE_ID,
-            "serviceName": policy["title"],
-            "staffMemberIds": [STAFF_ID],
             "startTime": {
                 "dateTime": slot["start"].strftime("%Y-%m-%dT%H:%M:%S"),
                 "timeZone": TZ_NAME,
@@ -384,16 +452,32 @@ def build_booking_payload(slot: dict, policy: dict) -> dict:
                 "dateTime": end.strftime("%Y-%m-%dT%H:%M:%S"),
                 "timeZone": TZ_NAME,
             },
-            "duration": f"{policy['minutes'] * 60}s",
-            "customerTimeZone": TZ_NAME,
-            "isLocationOnline": True,
+            "serviceId": SERVICE_ID,
+            "staffMemberIds": [STAFF_ID],
             "customers": [{
                 "name": CUSTOMER_NAME,
                 "emailAddress": CUSTOMER_EMAIL,
                 "phone": CUSTOMER_PHONE,
+                "notes": "",
                 "timeZone": TZ_NAME,
-                "notes": note,
+                "answeredCustomQuestions": answered,
+                "location": {"displayName": "",
+                             "address": {"street": "", "type": "Other"}},
+                "smsNotificationsEnabled": False,
+                "instanceId": "",
+                "price": 0,
+                "priceType": "SERVICEDEFAULTPRICETYPES_NOT_SET",
             }],
+            "isLocationOnline": False,
+            "smsNotificationsEnabled": False,
+            "verificationCode": "",
+            "customerTimeZone": TZ_NAME,
+            "trackingDataId": "",
+            "bookingFormInfoList": [],
+            "price": 0,
+            "priceType": "SERVICEDEFAULTPRICETYPES_NOT_SET",
+            "isAllDay": False,
+            "additionalRecipients": [],
         }
     }
 
