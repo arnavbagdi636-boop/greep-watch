@@ -5,6 +5,11 @@ on:
     # GitHub deprioritises schedules on low-traffic repos, so this fires far
     # less often than every 5 minutes. It is a fallback, not the main trigger.
     - cron: "*/5 * * * *"
+    # Guarantee a run is already going when a new day drops onto the 45-day
+    # window at Eastern midnight. Cron is UTC and midnight ET is 04:00 UTC in
+    # summer time, 05:00 UTC in winter, so fire ten minutes before both.
+    - cron: "50 3 * * *"
+    - cron: "50 4 * * *"
   # The reliable trigger: an external scheduler POSTs here.
   repository_dispatch:
     types: [watch]
@@ -54,7 +59,12 @@ jobs:
           CUSTOMER_PHONE: ${{ secrets.CUSTOMER_PHONE }}
           CUSTOMER_EMAIL: ${{ secrets.CUSTOMER_EMAIL }}
           COURSE_ENROLLMENT: "Alg 2 / Alg 2 Honors"
+          # Runners are UTC. Every slot time is Eastern wall-clock, so without
+          # this the midnight burst fired at 8 PM local and lead-time checks
+          # were off by four to five hours.
+          TZ: America/New_York
           EARLIEST_TIME: ${{ vars.EARLIEST_TIME || '16:20' }}
+          LATEST_TIME: ${{ vars.LATEST_TIME || '23:59' }}
           MONTHLY_CAP: ${{ vars.MONTHLY_CAP || '2' }}
           # Held at once. Starts at 1 so the first live run books a single
           # appointment: the POST field names are inferred, not documented, so

@@ -64,6 +64,17 @@ STAFF_ID = env("BOOKINGS_STAFF_ID", False,
 EARLIEST = env("EARLIEST_TIME", False, "16:20")
 EARLIEST_H, EARLIEST_M = (int(x) for x in EARLIEST.split(":"))
 
+# Latest acceptable START. The service publishes 18:00-20:00 Tue/Thu windows
+# that the booking page never offers, so without a ceiling a midday floor
+# would aim the watcher at evening starts no customer can book.
+LATEST = env("LATEST_TIME", False, "23:59")
+LATEST_H, LATEST_M = (int(x) for x in LATEST.split(":"))
+
+# Midnight is when a new day lands on the 45-day advance window, so poll fast
+# across it and slowly the rest of the time.
+BURST_INTERVAL = float(env("BURST_INTERVAL", False, "15"))
+BURST_START, BURST_END = dt.time(23, 58), dt.time(0, 6)
+
 # Identity submitted with the booking. No defaults on purpose: a booking that
 # went out under a placeholder name would be worse than no booking.
 CUSTOMER_NAME = env("CUSTOMER_NAME", False)
@@ -210,9 +221,15 @@ def fetch_policy(sess: requests.Session) -> dict:
                 for s in (day.get("timeSlots") or [])
             )
 
+    # Start times sit on this grid, anchored to each window's start - the
+    # booking page offers 11:00/11:20/11:40/12:00/12:20 for a 20-minute
+    # interval inside an 11:00-13:00 window.
+    interval = int(re.sub(r"\D", "", pol.get("timeSlotInterval") or "PT20M") or 20)
+
     return {
         "title": svc.get("title") or "",
         "minutes": minutes,
+        "interval": max(5, interval),
         "lead_days": iso_duration_days(pol.get("minimumLeadTime"), 1),
         "advance_days": iso_duration_days(pol.get("maximumAdvance"), 45),
         "questions": questions,
@@ -284,6 +301,8 @@ def eligible(slot: dict, now: dt.datetime, policy: dict) -> bool:
         return False
     if slot["start"].time() < dt.time(EARLIEST_H, EARLIEST_M):
         return False
+    if slot["start"].time() > dt.time(LATEST_H, LATEST_M):
+        return False
     if not within_service_window(slot["start"], policy):
         return False
     # The server rejects anything inside minimumLeadTime, so never aim there.
@@ -292,6 +311,36 @@ def eligible(slot: dict, now: dt.datetime, policy: dict) -> bool:
     if slot["start"] > now + dt.timedelta(days=policy["advance_days"]):
         return False
     return True
+
+
+def candidates(gaps: list, policy: dict) -> list:
+    """Expand free gaps into the individual start times a customer can pick.
+
+    A free gap is not a slot. An 11:00-13:00 gap on a 20-minute grid offers
+    five bookable starts, and judging the gap by its 11:00 opening alone threw
+    away 12:00 and 12:20 - the only two Arnav can attend, since he is in class
+    until noon. Starts are anchored to each service window's opening, which
+    is how the booking page produces 11:00/11:20/11:40/12:00/12:20.
+    """
+    step = dt.timedelta(minutes=policy["interval"])
+    length = dt.timedelta(minutes=policy["minutes"])
+    windows = policy.get("windows") or {}
+    seen, out = set(), []
+    for gap in gaps:
+        if not gap["status"].endswith("AVAILABLE"):
+            continue
+        day = gap["start"].replace(hour=0, minute=0, second=0, microsecond=0)
+        for w_start, w_end in windows.get(gap["start"].strftime("%A")) or []:
+            start = day + dt.timedelta(minutes=w_start)
+            limit = min(day + dt.timedelta(minutes=w_end), gap["end"])
+            while start + length <= limit:
+                if start >= gap["start"] and start not in seen:
+                    seen.add(start)
+                    out.append({"start": start, "end": start + length,
+                                "minutes": float(policy["minutes"]),
+                                "status": "AVAILABLE"})
+                start += step
+    return sorted(out, key=lambda s: s["start"])
 
 
 def key_of(slot: dict) -> str:
@@ -558,9 +607,8 @@ def send_telegram(text: str) -> bool:
 def check(sess: requests.Session, data: dict, policy: dict, dry: bool) -> dict:
     now = dt.datetime.now()
     slots = fetch_slots(sess, policy)
-    matches = sorted((s for s in slots if eligible(s, now, policy)),
-                     key=lambda s: s["start"])
-    print(f"[{now:%m-%d %H:%M:%S}] {len(slots)} windows, {len(matches)} eligible",
+    matches = [s for s in candidates(slots, policy) if eligible(s, now, policy)]
+    print(f"[{now:%m-%d %H:%M:%S}] {len(slots)} gaps, {len(matches)} eligible starts",
           flush=True)
 
     if not matches:
@@ -664,18 +712,17 @@ def main() -> int:
     print(f"service: {policy['title']} ({policy['minutes']} min), "
           f"lead {policy['lead_days']}d, advance {policy['advance_days']}d",
           flush=True)
-    print(f"rules: start >= {EARLIEST}, cap {MONTHLY_CAP}/month, "
+    print(f"rules: {EARLIEST} <= start <= {LATEST}, cap {MONTHLY_CAP}/month, "
           f"{CONCURRENT_CAP} at once, "
           f"mode={'BOOK' if args.book else 'dry-run'}", flush=True)
 
     if args.status:
         slots = fetch_slots(sess, policy)
-        free = sorted((s for s in slots if s["status"].endswith("AVAILABLE")),
-                      key=lambda s: s["start"])
-        print(f"{len(free)} open window(s):")
-        for s in free:
-            mark = "ELIGIBLE" if eligible(s, now, policy) else "        "
-            print(f"  {mark} {pretty(s['start']):<26} {int(s['minutes']):>3} min")
+        starts = candidates(slots, policy)
+        good = [s for s in starts if eligible(s, now, policy)]
+        print(f"{len(starts)} bookable start(s), {len(good)} eligible:")
+        for s in good:
+            print(f"  ELIGIBLE {pretty(s['start']):<26} {int(s['minutes']):>3} min")
         print(f"booked in {now:%Y-%m}: "
               f"{len(booked_in_month(data, f'{now:%Y-%m}'))}/{MONTHLY_CAP}")
         print(f"upcoming held:    "
@@ -697,7 +744,11 @@ def main() -> int:
         remaining = (deadline - dt.datetime.now()).total_seconds()
         if remaining <= 0:
             break
-        time.sleep(min(args.interval, remaining))
+        t = dt.datetime.now().time()
+        in_burst = t >= BURST_START or t <= BURST_END  # wraps past midnight
+        # Still I/O-bound: a 15s burst is ~25 short requests, each spent
+        # almost entirely waiting on the network.
+        time.sleep(min(BURST_INTERVAL if in_burst else args.interval, remaining))
 
     data["passes"] = passes
     save_state(data)
