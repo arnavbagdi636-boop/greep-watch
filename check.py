@@ -40,7 +40,7 @@ STATE_FILE = Path(__file__).resolve().parent / "state.json"
 # permanently are remembered against the version that failed, so fixing the
 # payload automatically makes them eligible again instead of needing the
 # failure list cleared by hand.
-PAYLOAD_VERSION = 2
+PAYLOAD_VERSION = 3
 HTTP_TIMEOUT = 45.0
 TZ_NAME = "Eastern Standard Time"
 UA = "greep-watch/2.0 (personal appointment watcher)"
@@ -103,6 +103,40 @@ def redact(text: str) -> str:
             loose = r"\+?1?\D{0,2}" + r"\D{0,2}".join(digits)
             out = re.sub(loose, "[redacted]", out)
     return out
+
+
+LOCK_FILE = Path(__file__).resolve().parent / "check.lock"
+_LOCK_HANDLE = None   # held for the process lifetime; the OS frees it on exit
+
+
+def acquire_lock() -> bool:
+    """Take an exclusive OS lock so two watchers cannot run at once.
+
+    One pass costs 0.03 CPU-seconds over ~12 seconds of wall clock - it is
+    waiting on the network, not computing - so a single watcher is
+    unmeasurable. Stacked instances are the only realistic way this becomes a
+    CPU or rate-limit problem, and the way that happens is a forgotten window
+    plus a new run. An OS lock cannot be sidestepped by deleting a file, and
+    the kernel releases it when the holder dies, so a crash leaves nothing
+    stale behind.
+    """
+    global _LOCK_HANDLE
+    try:
+        fh = LOCK_FILE.open("a+")
+    except OSError:
+        return True  # cannot create a lock file; do not block the watcher
+    try:
+        try:
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except ImportError:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return False
+    _LOCK_HANDLE = fh
+    return True
 
 
 def pretty(when: dt.datetime) -> str:
@@ -313,30 +347,54 @@ def git_persist(message: str) -> bool:
 # --------------------------------------------------------------------------
 
 def build_booking_payload(slot: dict, policy: dict) -> dict:
+    """Build the create-appointment body.
+
+    Field names were established by probing the endpoint with single-field
+    payloads; it answers 400 "Unknown field: X" for anything it does not
+    recognise, so a probe that stops complaining about X confirms X.
+
+    What that established:
+      * the body is wrapped in "appointment" - the only wrapper accepted
+      * the time fields are startTime/endTime, NOT startDateTime/endDateTime,
+        and each is a {dateTime, timeZone} object
+      * it is a protobuf service, so "duration" is a google.protobuf.Duration
+        and serialises as "1800s", not ISO-8601 "PT30M"
+      * customers[] takes name, emailAddress, phone, timeZone and notes;
+        displayName, email, address and customerId are all rejected
+
+    STILL UNRESOLVED: where the required "Course enrollment" answer goes.
+    Every plausible name was rejected at appointment level, inside
+    customers[], and as a sibling of "appointment". Until it is found, the
+    answer rides in customers[].notes - accepted by the API, and it puts the
+    information in front of the teacher either way. If the server insists on
+    the real field, it will say so by name and that completes the schema.
+    """
     end = slot["start"] + dt.timedelta(minutes=policy["minutes"])
-    answers = [{"questionId": qid, "answer": COURSE_ENROLLMENT}
-               for qid in policy["required_qids"]]
+    note = f"Course enrollment: {COURSE_ENROLLMENT}"
     return {
-        "serviceId": SERVICE_ID,
-        "serviceName": policy["title"],
-        "staffMemberIds": [STAFF_ID],
-        "startDateTime": {
-            "dateTime": slot["start"].strftime("%Y-%m-%dT%H:%M:%S"),
-            "timeZone": TZ_NAME,
-        },
-        "endDateTime": {
-            "dateTime": end.strftime("%Y-%m-%dT%H:%M:%S"),
-            "timeZone": TZ_NAME,
-        },
-        "customers": [{
-            "name": CUSTOMER_NAME,
-            "emailAddress": CUSTOMER_EMAIL,
-            "phone": CUSTOMER_PHONE,
-            "timeZone": TZ_NAME,
-            "customQuestionAnswers": answers,
-        }],
-        "customerTimeZone": TZ_NAME,
-        "isLocationOnline": True,
+        "appointment": {
+            "serviceId": SERVICE_ID,
+            "serviceName": policy["title"],
+            "staffMemberIds": [STAFF_ID],
+            "startTime": {
+                "dateTime": slot["start"].strftime("%Y-%m-%dT%H:%M:%S"),
+                "timeZone": TZ_NAME,
+            },
+            "endTime": {
+                "dateTime": end.strftime("%Y-%m-%dT%H:%M:%S"),
+                "timeZone": TZ_NAME,
+            },
+            "duration": f"{policy['minutes'] * 60}s",
+            "customerTimeZone": TZ_NAME,
+            "isLocationOnline": True,
+            "customers": [{
+                "name": CUSTOMER_NAME,
+                "emailAddress": CUSTOMER_EMAIL,
+                "phone": CUSTOMER_PHONE,
+                "timeZone": TZ_NAME,
+                "notes": note,
+            }],
+        }
     }
 
 
@@ -504,7 +562,15 @@ def main() -> int:
                     help="actually submit bookings (default is a dry run)")
     ap.add_argument("--status", action="store_true",
                     help="list open windows and the cap state, then exit")
+    ap.add_argument("--force", action="store_true",
+                    help="start even if another watcher holds the lock")
     args = ap.parse_args()
+
+    # --status is one read and exits, so it never needs to hold the lock.
+    if not args.status and not acquire_lock() and not args.force:
+        print("another watcher already holds the lock; refusing to start a "
+              "second. Stop it, or pass --force.", flush=True)
+        return 1
 
     sess = session()
     policy = fetch_policy(sess)
