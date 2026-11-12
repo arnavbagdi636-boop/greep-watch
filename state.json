@@ -17,16 +17,16 @@
       "confirmed": true,
       "id": "",
       "slot": "2026-11-12T12:00"
-    },
-    {
-      "booked_at": "2026-11-12T12:00:37",
-      "confirmed": false,
-      "id": "",
-      "slot": "2026-12-03T12:00"
     }
   ],
-  "failed": {},
-  "last_check": "2026-11-12T12:00:48",
+  "failed": {
+    "2026-12-03T12:00": {
+      "at": "2026-11-12T12:00:37",
+      "error": "HTTP 400: { \"error\": \"Status(StatusCode=\\\"InvalidArgument\\\", Detail=\\\"Custom question is missing required question or answer\\\")\", \"code\": 3, \"message\": \"Status(StatusCode=\\\"InvalidArgument\\\", Detail=\\",
+      "version": 4
+    }
+  },
+  "last_check": "2026-11-12T12:00:50",
   "matches": 0,
   "passes": 79
 }
